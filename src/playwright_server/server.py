@@ -158,12 +158,16 @@ import os
 
 import asyncio
 
+# Shared session storage for all tool handlers
+_sessions: dict[str, any] = {}
+_playwright: any = None
+
 def update_page_after_click(func):
     async def wrapper(self, name: str, arguments: dict | None):
-        if not self._sessions:
+        if not _sessions:
             return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         
         new_page_future = asyncio.ensure_future(page.context.wait_for_event("page", timeout=3000))
         
@@ -171,30 +175,66 @@ def update_page_after_click(func):
         try:
             new_page = await new_page_future
             await new_page.wait_for_load_state()
-            self._sessions[session_id]["page"] = new_page
+            _sessions[session_id]["page"] = new_page
         except:
             pass
-            # if page.url != self._sessions[session_id]["page"].url:
+            # if page.url != _sessions[session_id]["page"].url:
             #     await page.wait_for_load_state()
-            #     self._sessions[session_id]["page"] = page
+            #     _sessions[session_id]["page"] = page
         
         return result
     return wrapper
 
-class ToolHandler:
-    _sessions: dict[str, any] = {}
-    _playwright: any = None
+async def _ensure_valid_session():
+    """Ensure we have a valid browser session, create one if needed"""
+    global _sessions, _playwright
+    
+    # Check if we have a valid session and browser
+    if _sessions:
+        session_id = list(_sessions.keys())[-1]
+        try:
+            # Test if the browser is still alive by checking if page is still connected
+            page = _sessions[session_id]["page"]
+            browser = _sessions[session_id]["browser"]
+            
+            # More reliable check - see if browser is connected
+            if not page.is_closed() and browser.is_connected():
+                return  # Session is valid
+        except Exception as e:
+            # Browser/page is closed, clear sessions
+            print(f"Browser session validation failed: {e}, creating new session...")
+        
+        # If we get here, session is invalid - clear it
+        _sessions.clear()
+        if _playwright:
+            try:
+                await _playwright.stop()
+            except:
+                pass
+            _playwright = None
+    
+    if not _sessions:
+        # Create new session
+        print("Creating new browser session...")
+        _playwright = await async_playwright().start()
+        browser = await _playwright.chromium.launch(headless=False)
+        page = await browser.new_page()
+        session_id = str(uuid.uuid4())
+        _sessions[session_id] = {"browser": browser, "page": page}
 
+class ToolHandler:
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
         raise NotImplementedError
 
 class NewSessionToolHandler(ToolHandler):
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        self._playwright = await async_playwright().start()
-        browser = await self._playwright.chromium.launch(headless=False)
+        global _sessions, _playwright
+        
+        _playwright = await async_playwright().start()
+        browser = await _playwright.chromium.launch(headless=False)
         page = await browser.new_page()
         session_id = str(uuid.uuid4())
-        self._sessions[session_id] = {"browser": browser, "page": page}
+        _sessions[session_id] = {"browser": browser, "page": page}
         url = arguments.get("url")
         if url:
             if not url.startswith("http://") and not url.startswith("https://"):
@@ -204,24 +244,21 @@ class NewSessionToolHandler(ToolHandler):
 
 class NavigateToolHandler(ToolHandler):
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if not self._sessions:
-            await NewSessionToolHandler().handle("",{})
-            # return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        await _ensure_valid_session()
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         url = arguments.get("url")
         if not url.startswith("http://") and not url.startswith("https://"):
             url = "https://" + url
         await page.goto(url)
-        text_content=await GetTextContentToolHandler().handle("",{})
-        return [types.TextContent(type="text", text=f"Navigated to {url}\npage_text_content[:200]:\n\n{text_content[:200]}")]
+        text_content = await GetTextContentToolHandler().handle("", {})
+        return [types.TextContent(type="text", text=f"Navigated to {url}\npage_text_content[:200]:\n\n{text_content[0].text[:200]}")]
 
 class ScreenshotToolHandler(ToolHandler):
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if not self._sessions:
-            return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        await _ensure_valid_session()
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         name = arguments.get("name")
         selector = arguments.get("selector")
         # full_page = arguments.get("fullPage", False)
@@ -238,20 +275,18 @@ class ScreenshotToolHandler(ToolHandler):
 class ClickToolHandler(ToolHandler):
     @update_page_after_click
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if not self._sessions:
-            return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        await _ensure_valid_session()
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         selector = arguments.get("selector")
         await page.locator(selector).click()
         return [types.TextContent(type="text", text=f"Clicked element with selector {selector}")]
 
 class FillToolHandler(ToolHandler):
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if not self._sessions:
-            return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        await _ensure_valid_session()
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         selector = arguments.get("selector")
         value = arguments.get("value")
         await page.locator(selector).fill(value)
@@ -259,10 +294,9 @@ class FillToolHandler(ToolHandler):
 
 class EvaluateToolHandler(ToolHandler):
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if not self._sessions:
-            return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        await _ensure_valid_session()
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         script = arguments.get("script")
         result = await page.evaluate(script)
         return [types.TextContent(type="text", text=f"Evaluated script, result: {result}")]
@@ -270,20 +304,18 @@ class EvaluateToolHandler(ToolHandler):
 class ClickTextToolHandler(ToolHandler):
     @update_page_after_click
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if not self._sessions:
-            return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        await _ensure_valid_session()
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         text = arguments.get("text")
         await page.locator(f"text={text}").nth(0).click()
         return [types.TextContent(type="text", text=f"Clicked element with text {text}")]
 
 class GetTextContentToolHandler(ToolHandler):
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if not self._sessions:
-            return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        await _ensure_valid_session()
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         # text_contents = await page.locator('body').all_inner_texts()
 
 
@@ -322,10 +354,9 @@ class GetTextContentToolHandler(ToolHandler):
 
 class GetHtmlContentToolHandler(ToolHandler):
     async def handle(self, name: str, arguments: dict | None) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        if not self._sessions:
-            return [types.TextContent(type="text", text="No active session. Please create a new session first.")]
-        session_id = list(self._sessions.keys())[-1]
-        page = self._sessions[session_id]["page"]
+        await _ensure_valid_session()
+        session_id = list(_sessions.keys())[-1]
+        page = _sessions[session_id]["page"]
         selector = arguments.get("selector")
         html_content = await page.locator(selector).inner_html()
         return [types.TextContent(type="text", text=f"HTML content of element with selector {selector}: {html_content}")]
@@ -358,20 +389,290 @@ async def handle_call_tool(
         raise ValueError(f"Unknown tool: {name}")
 
 async def main():
-    # Run the server using stdin/stdout streams
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="playwright-plus-server",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
+    import sys
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Playwright MCP Server')
+    parser.add_argument('--transport', choices=['stdio', 'http', 'sse'], default='stdio',
+                       help='Transport type: stdio (default), http, or sse')
+    parser.add_argument('--host', default='localhost', 
+                       help='Host for HTTP transport (default: localhost)')
+    parser.add_argument('--port', type=int, default=3000,
+                       help='Port for HTTP transport (default: 3000)')
+    
+    args = parser.parse_args()
+    
+    if args.transport in ['http', 'sse']:
+        # HTTP/SSE transport using FastAPI
+        from fastapi import FastAPI, Request, HTTPException
+        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.middleware.cors import CORSMiddleware
+        import uvicorn
+        import json
+        import asyncio
+        
+        app = FastAPI(title="Playwright MCP Server", version="0.1.0")
+        
+        # Add CORS middleware for OpenAI compatibility
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],  # In production, be more specific
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
         )
+        
+        if args.transport == 'sse':
+            @app.post("/sse")
+            async def sse_endpoint(request: Request):
+                """Handle MCP requests over Server-Sent Events (OpenAI format)"""
+                try:
+                    data = await request.json()
+                    
+                    # Handle different MCP method types
+                    method = data.get("method")
+                    params = data.get("params", {})
+                    request_id = data.get("id")
+                    
+                    async def generate_response():
+                        if method == "tools/list":
+                            # Get available tools
+                            tools = await handle_list_tools()
+                            response = {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "result": {"tools": [tool.model_dump() for tool in tools]}
+                            }
+                            yield f"data: {json.dumps(response)}\n\n"
+                        
+                        elif method == "tools/call":
+                            # Call a specific tool
+                            tool_name = params.get("name")
+                            arguments = params.get("arguments", {})
+                            
+                            try:
+                                result = await handle_call_tool(tool_name, arguments)
+                                response = {
+                                    "jsonrpc": "2.0", 
+                                    "id": request_id,
+                                    "result": {
+                                        "content": [content.model_dump() for content in result]
+                                    }
+                                }
+                                yield f"data: {json.dumps(response)}\n\n"
+                            except Exception as e:
+                                response = {
+                                    "jsonrpc": "2.0",
+                                    "id": request_id,
+                                    "error": {"code": -1, "message": str(e)}
+                                }
+                                yield f"data: {json.dumps(response)}\n\n"
+                        
+                        elif method == "initialize":
+                            # Initialize the server
+                            response = {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "result": {
+                                    "protocolVersion": "2024-11-05",
+                                    "capabilities": {
+                                        "tools": {"listChanged": True},
+                                        "resources": {},
+                                        "prompts": {},
+                                        "experimental": {}
+                                    },
+                                    "serverInfo": {
+                                        "name": "playwright-plus-server",
+                                        "version": "0.1.0"
+                                    }
+                                }
+                            }
+                            yield f"data: {json.dumps(response)}\n\n"
+                        
+                        else:
+                            response = {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "error": {"code": -32601, "message": f"Method not found: {method}"}
+                            }
+                            yield f"data: {json.dumps(response)}\n\n"
+                    
+                    return StreamingResponse(
+                        generate_response(),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                            "Access-Control-Allow-Headers": "*",
+                        }
+                    )
+                    
+                except Exception as e:
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32603, "message": f"Internal error: {str(e)}"}
+                    }
+                    async def error_response():
+                        yield f"data: {json.dumps(response)}\n\n"
+                    
+                    return StreamingResponse(
+                        error_response(),
+                        media_type="text/event-stream"
+                    )
+            
+            # Add root endpoint for OpenAI compatibility
+            @app.post("/")
+            async def root_sse_endpoint(request: Request):
+                """Handle MCP requests at root path (OpenAI expects this)"""
+                return await sse_endpoint(request)
+            
+            @app.get("/")
+            async def root_info():
+                """Provide server info at root path"""
+                return JSONResponse({
+                    "name": "playwright-plus-server",
+                    "version": "0.1.0",
+                    "protocol": "mcp",
+                    "transport": "sse",
+                    "endpoints": {
+                        "mcp": "/",
+                        "sse": "/sse",
+                        "health": "/health"
+                    }
+                })
+        
+        @app.post("/mcp")
+        async def mcp_endpoint(request: Request):
+            """Handle MCP JSON-RPC requests over HTTP"""
+            try:
+                data = await request.json()
+                
+                # Handle different MCP method types
+                method = data.get("method")
+                params = data.get("params", {})
+                request_id = data.get("id")
+                
+                if method == "tools/list":
+                    # Get available tools
+                    tools = await handle_list_tools()
+                    return JSONResponse({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"tools": [tool.model_dump() for tool in tools]}
+                    })
+                
+                elif method == "tools/call":
+                    # Call a specific tool
+                    tool_name = params.get("name")
+                    arguments = params.get("arguments", {})
+                    
+                    try:
+                        result = await handle_call_tool(tool_name, arguments)
+                        return JSONResponse({
+                            "jsonrpc": "2.0", 
+                            "id": request_id,
+                            "result": {
+                                "content": [content.model_dump() for content in result]
+                            }
+                        })
+                    except Exception as e:
+                        return JSONResponse({
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "error": {"code": -1, "message": str(e)}
+                        })
+                
+                elif method == "initialize":
+                    # Initialize the server
+                    return JSONResponse({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {
+                                "tools": {"listChanged": True},
+                                "resources": {},
+                                "prompts": {},
+                                "experimental": {}
+                            },
+                            "serverInfo": {
+                                "name": "playwright-plus-server",
+                                "version": "0.1.0"
+                            }
+                        }
+                    })
+                
+                else:
+                    return JSONResponse({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32601, "message": f"Method not found: {method}"}
+                    })
+                    
+            except Exception as e:
+                return JSONResponse({
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32603, "message": f"Internal error: {str(e)}"}
+                })
+        
+        @app.get("/health")
+        async def health_check():
+            """Health check endpoint"""
+            return {"status": "healthy", "server": "playwright-mcp"}
+        
+        @app.options("/mcp")
+        @app.options("/sse")
+        @app.options("/")
+        async def options_handler():
+            """Handle CORS preflight requests"""
+            return JSONResponse(
+                content="OK",
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                }
+            )
+        
+        transport_type = "SSE" if args.transport == 'sse' else "HTTP"
+        endpoint = "/sse" if args.transport == 'sse' else "/mcp"
+        
+        print(f"🚀 Starting Playwright MCP Server on {transport_type} transport")
+        print(f"📡 Server running at: http://{args.host}:{args.port}")
+        print(f"🔧 MCP endpoint: http://{args.host}:{args.port}{endpoint}")
+        print(f"❤️ Health check: http://{args.host}:{args.port}/health")
+        
+        # Create server configuration for async serving
+        config = uvicorn.Config(
+            app=app,
+            host=args.host,
+            port=args.port,
+            log_level="info"
+        )
+        server_instance = uvicorn.Server(config)
+        await server_instance.serve()
+        
+    else:
+        # Original stdio transport
+        print("🚀 Starting Playwright MCP Server on stdio transport")
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="playwright-plus-server",
+                    server_version="0.1.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
+                ),
+            )
 
 if __name__ == "__main__":
     asyncio.run(main())
